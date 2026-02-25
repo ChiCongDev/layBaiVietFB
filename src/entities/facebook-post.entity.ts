@@ -41,6 +41,13 @@ export class FacebookPost {
   @Column({ name: 'comments_count', default: 0 })
   commentsCount: number;
 
+  @Column({ name: 'comments', type: 'json', nullable: true })
+  comments: Array<{
+    author: string;
+    content: string;
+    timestamp: string;
+  }>;
+
   @Column({ name: 'shares_count', default: 0 })
   sharesCount: number;
 

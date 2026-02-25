@@ -54,6 +54,14 @@ export class FacebookService {
     } catch (error) {
       this.logger.error('Lỗi crawl:', error.message);
       throw error;
+    } finally {
+      // QUAN TRỌNG: Đóng browser sau mỗi lần crawl để tránh zombie process
+      try {
+        await this.crawlerService.closeBrowser();
+        this.logger.log('Đã đóng browser');
+      } catch (error) {
+        this.logger.warn('Lỗi khi đóng browser:', error.message);
+      }
     }
   }
 
@@ -69,10 +77,11 @@ export class FacebookService {
     if (existing) {
       // Update nếu đã tồn tại
       this.logger.debug(`Cập nhật bài viết: ${crawledPost.postId}`);
-      
+
       existing.content = crawledPost.content || existing.content;
       existing.likesCount = crawledPost.likesCount;
       existing.commentsCount = crawledPost.commentsCount;
+      existing.comments = crawledPost.comments;
       existing.sharesCount = crawledPost.sharesCount;
       existing.imageUrls = crawledPost.imageUrls;
 
@@ -93,6 +102,7 @@ export class FacebookService {
       imageUrls: crawledPost.imageUrls,
       likesCount: crawledPost.likesCount,
       commentsCount: crawledPost.commentsCount,
+      comments: crawledPost.comments,
       sharesCount: crawledPost.sharesCount,
       postedAt: new Date(crawledPost.postedAt),
     });
