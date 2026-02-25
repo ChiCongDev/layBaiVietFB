@@ -14,6 +14,7 @@ export interface CrawledPost {
   imageUrls: string[];
   likesCount: number;
   commentsCount: number;
+  uniqueCommentersCount: number;
   comments: Array<{
     author: string;
     content: string;
@@ -416,6 +417,47 @@ export class FacebookCrawlerService {
     this.logger.log(`Tổng số articles sau khi scroll: ${previousArticleCount}`);
   }
 
+  /**
+   * Visit một post cụ thể và extract full data (để check unique commenters)
+   */
+  async visitPostAndEnrich(post: CrawledPost): Promise<CrawledPost | null> {
+    try {
+      const browser = await this.initBrowser();
+      const page = await browser.newPage();
+
+      // Capture console logs
+      page.on('console', (msg) => {
+        const text = msg.text();
+        if (text.includes('✓') || text.includes('FOUND') || text.includes('DEBUG')) {
+          this.logger.debug(`[Browser Console] ${text}`);
+        }
+      });
+
+      // Đăng nhập bằng cookies
+      await this.loginWithCookies(page);
+
+      // Extract full data từ post URL
+      const fullData = await this.extractFullPostData(page, post.postUrl);
+
+      this.logger.debug(`Unique commenters: ${fullData.uniqueCommentersCount} (from ${fullData.comments.length} comments)`);
+
+      // Merge data
+      return {
+        ...post,
+        content: fullData.content || post.content,
+        imageUrls: fullData.imageUrls.length > 0 ? fullData.imageUrls : post.imageUrls,
+        likesCount: fullData.likesCount,
+        commentsCount: fullData.commentsCount,
+        uniqueCommentersCount: fullData.uniqueCommentersCount,
+        comments: fullData.comments,
+        sharesCount: fullData.sharesCount,
+      };
+    } catch (error) {
+      this.logger.error(`Lỗi khi visit post ${post.postUrl}:`, error.message);
+      return null;
+    }
+  }
+
   async crawlGroupPosts(groupUrl: string, limit: number = 10): Promise<CrawledPost[]> {
     const browser = await this.initBrowser();
     const page = await browser.newPage();
@@ -633,12 +675,15 @@ export class FacebookCrawlerService {
 
           const fullData = await this.extractFullPostData(page, post.postUrl);
 
+          this.logger.debug(`✓ Unique commenters: ${fullData.uniqueCommentersCount} (from aria-labels in full document)`);
+
           // Merge data
           enrichedPosts.push({
             ...post,
             imageUrls: fullData.imageUrls.length > 0 ? fullData.imageUrls : post.imageUrls,
             likesCount: fullData.likesCount > 0 ? fullData.likesCount : post.likesCount,
             commentsCount: fullData.commentsCount > 0 ? fullData.commentsCount : post.commentsCount,
+            uniqueCommentersCount: fullData.uniqueCommentersCount,
             comments: fullData.comments || [],
             sharesCount: fullData.sharesCount > 0 ? fullData.sharesCount : post.sharesCount,
             content: fullData.content && fullData.content !== '[No content]' ? fullData.content : post.content,
@@ -682,6 +727,46 @@ export class FacebookCrawlerService {
     });
 
     this.logger.debug('Debug selectors:', JSON.stringify(debugInfo));
+
+    // THÊM: Dump toàn bộ page structure để tìm selector mới
+    const pageStructure = await page.evaluate(() => {
+      // Tìm tất cả divs có data-pagelet attribute
+      const pagelets = Array.from(document.querySelectorAll('[data-pagelet]'));
+      const pageletInfo = pagelets.map(el => ({
+        tagName: el.tagName,
+        pagelet: el.getAttribute('data-pagelet'),
+        children: el.children.length,
+        textLength: (el.textContent || '').length
+      }));
+
+      // Tìm các divs lớn có nhiều text (có thể là feed container)
+      const largeDivs = Array.from(document.querySelectorAll('div'))
+        .filter(div => {
+          const text = (div.textContent || '').trim();
+          return text.length > 100 && text.length < 50000 && div.children.length > 5;
+        })
+        .slice(0, 10)
+        .map(div => ({
+          id: div.id,
+          className: div.className.substring(0, 50),
+          childrenCount: div.children.length,
+          textLength: (div.textContent || '').length,
+          hasDataPagelet: !!div.getAttribute('data-pagelet'),
+          dataPagelet: div.getAttribute('data-pagelet')
+        }));
+
+      return {
+        pagelets: pageletInfo,
+        largeDivs: largeDivs,
+        totalDivs: document.querySelectorAll('div').length,
+        totalArticles: document.querySelectorAll('[role="article"]').length
+      };
+    });
+
+    this.logger.debug('=== PAGE STRUCTURE DUMP ===');
+    this.logger.debug(`Total divs: ${pageStructure.totalDivs}, articles: ${pageStructure.totalArticles}`);
+    this.logger.debug(`Pagelets (${pageStructure.pagelets.length}):`, JSON.stringify(pageStructure.pagelets.slice(0, 20), null, 2));
+    this.logger.debug(`Large divs (${pageStructure.largeDivs.length}):`, JSON.stringify(pageStructure.largeDivs, null, 2));
 
     const posts = await page.evaluate((groupId: string, limit: number) => {
       const results: any[] = [];
@@ -926,6 +1011,7 @@ export class FacebookCrawlerService {
               imageUrls: imageUrls.slice(0, 10),
               likesCount,
               commentsCount,
+              uniqueCommentersCount: 0, // Sẽ được tính sau khi extract comments
               comments: [],
               sharesCount,
               postedAt,
@@ -954,6 +1040,7 @@ export class FacebookCrawlerService {
     imageUrls: string[];
     likesCount: number;
     commentsCount: number;
+    uniqueCommentersCount: number;
     comments: Array<{
       author: string;
       content: string;
@@ -1695,109 +1782,52 @@ export class FacebookCrawlerService {
         // === EXTRACT TẤT CẢ COMMENTS ===
         const comments: Array<{ author: string; content: string; timestamp: string }> = [];
 
-        // Tìm tất cả comment elements
-        // Facebook comments thường có structure: div[role="article"] hoặc các div chứa comment
-        const commentSelectors = [
-          '[role="article"] [aria-label*="comment"]',
-          '[aria-label*="Comment by"]',
-          'div[class*="comment"]',
-          '[data-commentid]',
-        ];
-
+        // Tìm comment elements CHỈ trong phạm vi của post này
+        // Facebook render thêm các post khác bên dưới trang → phải giới hạn phạm vi tìm kiếm
         let commentElements: Element[] = [];
-        for (const selector of commentSelectors) {
-          commentElements = Array.from(statsContainer.querySelectorAll(selector));
-          if (commentElements.length > 0) {
-            console.log(`Found ${commentElements.length} comments IN STATS CONTAINER with selector: ${selector}`);
-            break;
-          }
+
+        // Xác định vùng comments của post: là anh em (sibling) hoặc con của statsContainer
+        // Comment section nằm SAU mainPost trong DOM, bên trong statsContainer hoặc parent của nó
+        const postContainer = statsContainer.parentElement || statsContainer;
+
+        // Strategy 1: Tìm trong postContainer (bao gồm main post + comments section ngay bên dưới)
+        const byAriaLabel = Array.from(postContainer.querySelectorAll('[aria-label*="Comment by"], [aria-label*="Bình luận của"]'));
+        if (byAriaLabel.length > 0) {
+          commentElements = byAriaLabel;
+          console.log(`Found ${commentElements.length} comments by aria-label in POST CONTAINER`);
         }
 
-        // Nếu không tìm được bằng selector, thử tìm bằng text pattern TRONG STATS CONTAINER
+        // Strategy 2: Nếu không tìm được trong postContainer, tìm toàn document nhưng giới hạn theo vị trí DOM
+        // Chỉ lấy elements xuất hiện SAU mainPost (comments section)
         if (commentElements.length === 0) {
-          // Tìm tất cả div TRONG STATS CONTAINER có text chứa dấu hiệu là comment
-          const allDivs = statsContainer.querySelectorAll('div');
-          for (const div of allDivs) {
-            const ariaLabel = div.getAttribute('aria-label') || '';
-            if (ariaLabel.includes('Comment by') || ariaLabel.includes('Bình luận của')) {
-              commentElements.push(div);
-              // Lấy HẾT, không giới hạn
-            }
-          }
-          console.log(`Found ${commentElements.length} comments IN STATS CONTAINER by aria-label pattern`);
+          const allByAriaLabel = Array.from(document.querySelectorAll('[aria-label*="Comment by"], [aria-label*="Bình luận của"]'));
+          // Lọc: chỉ giữ elements nằm SAU mainPost trong DOM (not contained within mainPost itself)
+          commentElements = allByAriaLabel.filter(elem => {
+            const position = mainPost.compareDocumentPosition(elem);
+            // Node.DOCUMENT_POSITION_FOLLOWING = 4 → elem nằm sau mainPost
+            return (position & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+          });
+          console.log(`Found ${commentElements.length} comments AFTER main post in document`);
         }
 
-        // SIMPLE FILTER: Chỉ lọc replies rõ ràng, không quá strict
-        const topLevelComments = commentElements.filter((elem, index) => {
-          // Chỉ lọc nếu element CÓ parent TRỰC TIẾP là comment khác
-          const parent = elem.parentElement;
-          if (!parent) return true;
+        // === ĐẾM UNIQUE COMMENTERS trực tiếp từ aria-label ===
+        // Set tự xử lý trùng lặp: 1 người comment 3 lần vẫn chỉ đếm là 1
+        const uniqueAuthors = new Set<string>();
+        const authorRegex = /(?:Comment by|Bình luận của)\s+(.+?)(?:\s*[·•]\s*|\s+\d+\s+(?:minute|hour|day|second|week|month|year|giờ|phút|giây|ngày|tuần|tháng|năm)|$)/i;
 
-          const parentAriaLabel = parent.getAttribute('aria-label') || '';
-          // Nếu parent TRỰC TIẾP là comment, thì đây là reply
-          if (parentAriaLabel.toLowerCase().includes('comment by') ||
-              parentAriaLabel.toLowerCase().includes('bình luận của')) {
-            return false; // Đây là reply
-          }
-
-          return true; // Keep it
-        });
-
-        console.log(`Filtered comments: ${commentElements.length} total, ${topLevelComments.length} kept (removed ${commentElements.length - topLevelComments.length} nested replies)`);
-
-        // Extract comment data
-        for (let i = 0; i < topLevelComments.length; i++) {
-          const elem = topLevelComments[i] as HTMLElement;
-
-          // Extract author từ aria-label hoặc từ link
-          let author = 'Unknown';
+        for (const elem of commentElements) {
           const ariaLabel = elem.getAttribute('aria-label') || '';
-
-          // Pattern: "Comment by [Author Name]" hoặc "Bình luận của [Author Name]"
-          const authorMatch = ariaLabel.match(/(?:Comment by|Bình luận của)\s+([^:,]+)/i);
+          const authorMatch = ariaLabel.match(authorRegex);
           if (authorMatch) {
-            author = authorMatch[1].trim();
-          } else {
-            // Fallback: tìm link profile
-            const authorLink = elem.querySelector('a[href*="/user/"], a[href*="/profile/"]');
-            if (authorLink) {
-              author = authorLink.textContent?.trim() || 'Unknown';
-            }
-          }
-
-          // Extract content
-          let commentContent = '';
-          const contentDiv = elem.querySelector('[dir="auto"]') || elem;
-          commentContent = contentDiv.textContent?.trim() || '';
-
-          // Clean content - remove author name if duplicated
-          if (commentContent.startsWith(author)) {
-            commentContent = commentContent.substring(author.length).trim();
-          }
-
-          // Extract timestamp
-          let timestamp = '';
-          const timeElements = elem.querySelectorAll('a[href*="/comment/"], span[class*="timestamp"], abbr');
-          for (const timeElem of timeElements) {
-            const text = timeElem.textContent?.trim() || '';
-            if (text && (text.includes('h') || text.includes('m') || text.includes('d') || text.includes('giờ') || text.includes('phút'))) {
-              timestamp = text;
-              break;
-            }
-          }
-
-          if (commentContent && commentContent.length > 0) {
-            comments.push({
-              author,
-              content: commentContent.substring(0, 500), // Limit 500 chars
-              timestamp: timestamp || 'Unknown',
-            });
+            const name = authorMatch[1].trim();
+            if (name) uniqueAuthors.add(name);
           }
         }
 
-        console.log(`Extracted ${comments.length} comments`);
+        const uniqueCommentersCount = uniqueAuthors.size;
+        console.log(`Unique commenters: ${uniqueCommentersCount} (${[...uniqueAuthors].slice(0, 10).join(', ')})`);
 
-        console.log(`Extracted from post page: content.length=${content.length}, images=${imageUrls.length}, likes=${likesCount}, comments=${commentsCount}, actualComments=${comments.length}, shares=${sharesCount}`);
+        console.log(`Extracted from post page: content.length=${content.length}, images=${imageUrls.length}, likes=${likesCount}, comments=${commentsCount}, uniqueCommenters=${uniqueCommentersCount}, shares=${sharesCount}`);
 
         return {
           content: content || '[No content]',
@@ -1806,6 +1836,7 @@ export class FacebookCrawlerService {
           commentsCount,
           comments,
           sharesCount,
+          uniqueCommentersCount,
         };
       });
 
@@ -1854,6 +1885,7 @@ export class FacebookCrawlerService {
         imageUrls: [],
         likesCount: 0,
         commentsCount: 0,
+        uniqueCommentersCount: 0,
         comments: [],
         sharesCount: 0,
       };

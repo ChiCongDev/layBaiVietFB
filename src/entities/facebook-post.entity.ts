@@ -41,6 +41,9 @@ export class FacebookPost {
   @Column({ name: 'comments_count', default: 0 })
   commentsCount: number;
 
+  @Column({ name: 'unique_commenters_count', default: 0 })
+  uniqueCommentersCount: number;
+
   @Column({ name: 'comments', type: 'json', nullable: true })
   comments: Array<{
     author: string;

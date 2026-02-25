@@ -81,6 +81,7 @@ export class FacebookService {
       existing.content = crawledPost.content || existing.content;
       existing.likesCount = crawledPost.likesCount;
       existing.commentsCount = crawledPost.commentsCount;
+      existing.uniqueCommentersCount = crawledPost.uniqueCommentersCount;
       existing.comments = crawledPost.comments;
       existing.sharesCount = crawledPost.sharesCount;
       existing.imageUrls = crawledPost.imageUrls;
@@ -102,6 +103,7 @@ export class FacebookService {
       imageUrls: crawledPost.imageUrls,
       likesCount: crawledPost.likesCount,
       commentsCount: crawledPost.commentsCount,
+      uniqueCommentersCount: crawledPost.uniqueCommentersCount,
       comments: crawledPost.comments,
       sharesCount: crawledPost.sharesCount,
       postedAt: new Date(crawledPost.postedAt),
@@ -228,6 +230,78 @@ export class FacebookService {
       await this.crawlAndSave();
     } catch (error) {
       this.logger.error('Scheduled crawl thất bại:', error.message);
+    }
+  }
+
+  /**
+   * Kiểm tra một post cụ thể - đếm số người bình luận
+   */
+  async checkSinglePost(postUrl: string): Promise<{
+    postUrl: string;
+    totalComments: number;
+    uniqueCommenters: number;
+    commenters: Array<{ name: string; commentCount: number }>;
+  }> {
+    this.logger.log(`Đang kiểm tra post: ${postUrl}`);
+
+    try {
+      // Tạo một "fake" crawled post chỉ có URL
+      const tempPost: CrawledPost = {
+        postId: 'temp',
+        groupId: 'temp',
+        groupName: '',
+        authorName: '',
+        authorProfileUrl: '',
+        content: '',
+        postUrl: postUrl,
+        imageUrls: [],
+        likesCount: 0,
+        commentsCount: 0,
+        uniqueCommentersCount: 0,
+        comments: [],
+        sharesCount: 0,
+        postedAt: new Date(),
+      };
+
+      // Visit post và lấy full data
+      const enrichedPost = await this.crawlerService.visitPostAndEnrich(tempPost);
+
+      if (!enrichedPost) {
+        throw new Error('Không thể truy cập post');
+      }
+
+      // Đếm số lần mỗi người comment
+      const commenterCounts = new Map<string, number>();
+
+      for (const comment of enrichedPost.comments || []) {
+        const author = comment.author;
+        if (author && author !== 'Unknown') {
+          commenterCounts.set(author, (commenterCounts.get(author) || 0) + 1);
+        }
+      }
+
+      // Chuyển thành array và sort theo số lượng comment
+      const commenters = Array.from(commenterCounts.entries())
+        .map(([name, commentCount]) => ({ name, commentCount }))
+        .sort((a, b) => b.commentCount - a.commentCount);
+
+      return {
+        postUrl: postUrl,
+        totalComments: enrichedPost.commentsCount,
+        uniqueCommenters: enrichedPost.uniqueCommentersCount,
+        commenters: commenters,
+      };
+    } catch (error) {
+      this.logger.error('Lỗi khi check post:', error.message);
+      throw error;
+    } finally {
+      // Đóng browser
+      try {
+        await this.crawlerService.closeBrowser();
+        this.logger.log('Đã đóng browser');
+      } catch (error) {
+        this.logger.warn('Lỗi khi đóng browser:', error.message);
+      }
     }
   }
 }

@@ -159,4 +159,38 @@ export class FacebookController {
       message: 'Đã xóa bài viết',
     };
   }
+
+  /**
+   * Kiểm tra số người bình luận trên một post cụ thể
+   * GET /facebook/check-post?url=https://www.facebook.com/groups/.../posts/...
+   */
+  @Get('check-post')
+  async checkSinglePost(@Query('url') postUrl: string) {
+    if (!postUrl) {
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Thiếu parameter "url"',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    try {
+      const result = await this.facebookService.checkSinglePost(postUrl);
+
+      return {
+        success: true,
+        data: result,
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          success: false,
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }
