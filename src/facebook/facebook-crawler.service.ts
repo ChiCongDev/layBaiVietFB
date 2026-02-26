@@ -584,7 +584,13 @@ export class FacebookCrawlerService {
       this.logger.debug(`Page has ${totalImagesDebug.total} img tags total, ${totalImagesDebug.scontent} with scontent`);
 
       // Scroll và extract từng đợt
-      for (let scrollIndex = 0; scrollIndex < Math.max(limit, 15); scrollIndex++) {
+      // Không giới hạn số lần scroll theo limit - chạy đến khi đủ bài hoặc hết bài mới
+      let noNewPostsCount = 0;
+      const maxNoNewPosts = 8; // Dừng sau 8 lần scroll liên tiếp không phát hiện bài mới nào
+      for (let scrollIndex = 0; scrollIndex < 10000; scrollIndex++) {
+        const prevLength = allPosts.length;
+        const prevSeenCount = seenPostIds.size;
+
         // Scroll một chút
         try {
           await page.evaluate(() => {
@@ -618,18 +624,38 @@ export class FacebookCrawlerService {
         });
 
         // Extract posts hiện tại
-        const newPosts = await this.extractPosts(page, groupUrl, limit * 2);
+        const extractLimit = limit >= 10000 ? 500 : limit * 2;
+        const newPosts = await this.extractPosts(page, groupUrl, extractLimit);
 
-        // Thêm vào danh sách (chỉ thêm posts mới)
+        // Thêm vào danh sách
         for (const post of newPosts) {
-          if (!seenPostIds.has(post.postId) && post.content !== '[No content]') {
-            seenPostIds.add(post.postId);
-            allPosts.push(post);
-            this.logger.debug(`✓ Extracted: ${post.authorName} - ${post.content.substring(0, 50)}...`);
+          // Real ID = chỉ chứa số (từ permalink), random ID = bắt đầu bằng "post_"
+          const isRealId = /^\d+$/.test(post.postId);
+
+          if (isRealId) {
+            // Bài có permalink: track vào seenPostIds kể cả khi không có content
+            // → tránh bị re-check lại mỗi scroll, fix false early-stop
+            if (!seenPostIds.has(post.postId)) {
+              seenPostIds.add(post.postId);
+              if (post.content !== '[No content]') {
+                allPosts.push(post);
+                this.logger.debug(`✓ Extracted: ${post.authorName} - ${post.content.substring(0, 50)}...`);
+              }
+            }
+          } else {
+            // Bài không có permalink (random ID): chỉ thêm nếu có content
+            if (post.content !== '[No content]') {
+              allPosts.push(post);
+              this.logger.debug(`✓ Extracted (no-permalink): ${post.authorName} - ${post.content.substring(0, 50)}...`);
+            }
           }
         }
 
-        this.logger.debug(`Scroll ${scrollIndex + 1} - Total extracted: ${allPosts.length}/${limit}`);
+        // newRealSeen: số bài có real permalink MỚI phát hiện lần này
+        // Dùng để detect hết feed, không dùng newAdded (để tránh bị dừng do bài [No content])
+        const newRealSeen = seenPostIds.size - prevSeenCount;
+        const newAdded = allPosts.length - prevLength;
+        this.logger.debug(`Scroll ${scrollIndex + 1} - New articles seen: ${newRealSeen}, Added: ${newAdded}, Total: ${allPosts.length}${limit < 10000 ? '/' + limit : ''}`);
 
         // Dừng nếu đã đủ
         if (allPosts.length >= limit) {
@@ -637,10 +663,17 @@ export class FacebookCrawlerService {
           break;
         }
 
-        // Dừng nếu không còn bài mới sau 3 lần
-        if (scrollIndex > 3 && allPosts.length === 0) {
-          this.logger.warn('Không tìm thấy bài viết nào, dừng lại');
-          break;
+        // Dừng khi không phát hiện thêm bài nào có real permalink nhiều lần liên tiếp
+        // (tức là feed đã hết, không còn bài mới để load)
+        if (newRealSeen === 0) {
+          noNewPostsCount++;
+          this.logger.debug(`Không có bài permalink mới (${noNewPostsCount}/${maxNoNewPosts})`);
+          if (noNewPostsCount >= maxNoNewPosts) {
+            this.logger.log(`Không còn bài mới sau ${maxNoNewPosts} lần cuộn liên tiếp, dừng lại (đã lấy ${allPosts.length} bài)`);
+            break;
+          }
+        } else {
+          noNewPostsCount = 0;
         }
       }
 
