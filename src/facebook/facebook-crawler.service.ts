@@ -425,10 +425,10 @@ export class FacebookCrawlerService {
       const browser = await this.initBrowser();
       const page = await browser.newPage();
 
-      // Capture console logs
+      // Capture console logs - bắt tất cả để debug
       page.on('console', (msg) => {
         const text = msg.text();
-        if (text.includes('✓') || text.includes('FOUND') || text.includes('DEBUG')) {
+        if (text && text.length > 0 && text.length < 5000) {
           this.logger.debug(`[Browser Console] ${text}`);
         }
       });
@@ -462,15 +462,10 @@ export class FacebookCrawlerService {
     const browser = await this.initBrowser();
     const page = await browser.newPage();
 
-    // Capture console logs từ browser
+    // Capture console logs từ browser - bắt tất cả để không bỏ sót
     page.on('console', msg => {
       const text = msg.text();
-      // Capture tất cả logs quan trọng
-      if (text.includes('Selector') || text.includes('Post') || text.includes('elements') ||
-          text.includes('===') || text.includes('DEBUG') || text.includes('IMG') ||
-          text.includes('Total') || text.includes('Sample') || text.includes('STATS') ||
-          text.includes('aria-label') || text.includes('Found likes') || text.includes('Found comments') ||
-          text.includes('FINAL')) {
+      if (text && text.length > 0 && text.length < 5000) {
         this.logger.debug(`[Browser Console] ${text}`);
       }
     });
@@ -658,6 +653,11 @@ export class FacebookCrawlerService {
       let posts = allPosts.slice(0, limit);
       this.logger.log(`Đã thu thập ${posts.length} post URLs`);
 
+      // Đảo ngược thứ tự: group feed hiện newest first
+      // → Reverse để process từ bài CŨ NHẤT (cuối feed) đến bài MỚI NHẤT (đầu feed)
+      posts = posts.reverse();
+      this.logger.log(`↩️ Đã đảo thứ tự: xử lý từ bài cũ → mới (${posts.length} bài)`);
+
       // BƯỚC 2: Visit từng post để lấy images và stats
       this.logger.log('Bắt đầu visit từng post để lấy full data...');
       const enrichedPosts: CrawledPost[] = [];
@@ -804,7 +804,8 @@ export class FacebookCrawlerService {
         try {
           // === STRATEGY: Extract ALL text, links, images - then filter ===
 
-          const allText = post.textContent || '';
+          // Dùng innerText thay vì textContent để có line breaks đúng giữa các elements
+          const allText = (post as HTMLElement).innerText || post.textContent || '';
           const allLinks = Array.from(post.querySelectorAll('a'));
 
           // THAY ĐỔI: Tìm images trong TOÀN BỘ article và children (bao gồm shadow DOM)
@@ -884,15 +885,16 @@ export class FacebookCrawlerService {
           // Extract Content - ĐƠN GIẢN HÓA
           let content = '';
 
-          // Lấy text dài nhất, chỉ lọc những dòng RÕ RÀNG là UI
+          // Lấy text dài nhất, lọc những dòng RÕ RÀNG là UI
           const textLines = allText.split('\n')
             .map(l => l.trim())
             .filter(l => {
               // Chỉ bỏ những dòng RÕ RÀNG là UI
               if (l.length < 3) return false;
               if (l === authorName) return false;
-              if (l.match(/^(Like|Comment|Share|Reply|Follow|Hide|Save|Report|Delete|Edit|Write a comment)$/i)) return false;
-              if (l.match(/^\d+\s*(h|m|d|w|y|hr|min|ago)$/i)) return false;
+              if (l.match(/^(Like|Comment|Share|Reply|Follow|Hide|Save|Report|Delete|Edit|Write a comment|LikeReply|LikeComment|ShareReply)$/i)) return false;
+              if (l.match(/^(Author|All-star contributor|Top contributor|All star contributor|Moderator|Admin)$/i)) return false;
+              if (l.match(/^\d+\s*(h|m|d|w|y|hr|min|ago|giờ|phút|ngày|tuần|tháng|năm)$/i)) return false;
               return true;
             });
 
@@ -904,12 +906,17 @@ export class FacebookCrawlerService {
               return line.length > longest.length ? line : longest;
             }, '');
 
-            // Chỉ làm sạch CƠ BẢN
+            // Làm sạch content
             if (authorName !== 'Unknown' && content.startsWith(authorName)) {
               content = content.substring(authorName.length).trim();
             }
             // Loại bỏ timestamp ở cuối nếu có
-            content = content.replace(/\s+\d+\s*(h|m|d|w|giờ|phút|ngày)\s*$/i, '');
+            content = content.replace(/\s+\d+\s*(h|m|d|w|giờ|phút|ngày|hr|min)\s*$/i, '');
+            // Loại bỏ UI buttons ở cuối
+            content = content.replace(/\s*(LikeReply|Like Reply|Like Comment Share)\s*$/i, '');
+            // Loại bỏ badge noise nếu còn
+            content = content.replace(/\b(Author|All-star contributor|Top contributor|Moderator|Admin)\b\s*/gi, '');
+            content = content.trim();
           }
 
           if (!content || content.length < 2) {
@@ -1048,18 +1055,57 @@ export class FacebookCrawlerService {
     }>;
     sharesCount: number;
   }> {
-    try {
-      // === DISABLE NETWORK INTERCEPTION - KHÔNG ỔN ĐỊNH ===
-      // Network approach không work vì:
-      // 1. Capture sai response (không phải của post)
-      // 2. Comment count không có trong API responses
-      // 3. Quá phức tạp và không đáng tin cậy
+    // === NETWORK INTERCEPTION: Thu thập unique commenters từ GraphQL responses ===
+    const commentersFromNetwork = new Set<string>();
+    const responseHandler = async (response: any) => {
+      try {
+        const url = response.url();
+        if (!url.includes('/api/graphql')) return;
+        const text = await response.text();
+        if (!text.includes('"author"')) return;
+        // Extract author names từ GraphQL comment responses
+        // Pattern: "author":{"__typename":"User","name":"Tên người dùng",...}
+        // Lưu ý: Facebook encode tiếng Việt thành \uXXXX trong JSON
+        const authorRegex = /"author"\s*:\s*\{/g;
+        let authorMatch;
+        while ((authorMatch = authorRegex.exec(text)) !== null) {
+          const startPos = authorMatch.index + authorMatch[0].length;
+          const slice = text.substring(startPos, startPos + 500);
+          // Dùng [^"]+ thay vì [^"\\]+ để match cả Unicode escapes (\u1ea3, etc.)
+          const nameMatch = slice.match(/"name"\s*:\s*"([^"]{1,150})"/);
+          if (nameMatch) {
+            let name = nameMatch[1].trim();
+            // Decode Unicode escapes (\u1ea3 → ả) bằng JSON.parse
+            try {
+              name = JSON.parse('"' + name + '"');
+            } catch (_) {
+              // Nếu decode lỗi, dùng tên gốc
+            }
+            // Lọc bỏ các giá trị không phải tên người (URL, số, quá ngắn)
+            if (name && name.length > 1 && !name.includes('http') && !name.includes('/')) {
+              commentersFromNetwork.add(name);
+            }
+          }
+        }
+      } catch (_) {
+        // Bỏ qua lỗi (response có thể là binary, bị abort, etc.)
+      }
+    };
 
+    try {
       let apiLikesCount = 0;
       let apiCommentsCount = 0;
 
+      // Strip query params để tránh Facebook mở comment popup thay vì trang post đầy đủ
+      // postUrl dạng: https://...posts/123/?comment_id=456&__cft__[0]=... → chỉ lấy phần base
+      const cleanPostUrl = postUrl.split('?')[0].replace(/\/$/, '') + '/';
+      this.logger.log(`Navigate to clean post URL: ${cleanPostUrl}`);
+
+      // Bắt đầu lắng nghe responses TRƯỚC KHI navigate để không bỏ sót responses
+      page.on('response', responseHandler);
+
       // Navigate đến post
-      await page.goto(postUrl, {
+      await page.goto(cleanPostUrl, {
         waitUntil: 'networkidle2',
         timeout: 30000,
       });
@@ -1071,42 +1117,52 @@ export class FacebookCrawlerService {
       // QUAN TRỌNG: Phải extract stats TRƯỚC khi click buttons vì Facebook sẽ thay đổi DOM!
       this.logger.debug('🎯 Extract likes/comments từ buttons TRƯỚC KHI click...');
 
+      // Tìm toàn bộ document (trang post riêng lẻ nên an toàn - chỉ có 1 post chính)
+      // Lấy MAX để tránh nhầm với comment-count của related posts
       const statsFromButtons = await page.evaluate(() => {
         const allButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"], a[role="button"]'));
+        console.log(`[STATS] Searching ${allButtons.length} buttons in WHOLE document`);
 
         let likes = 0;
         let comments = 0;
+        const allCommentButtons: string[] = [];
 
-        allButtons.forEach(button => {
+        // QUAN TRỌNG: Dùng FIRST "X comments" button, không phải MAX!
+        // Main post luôn ở TOP trang → button của nó xuất hiện ĐẦU TIÊN
+        // Related posts ở dưới → button của chúng xuất hiện SAU → không lấy nhầm
+        for (const button of allButtons) {
           const text = (button.textContent || '').trim();
 
-          // Extract comments: "384 comments", "1 comment"
-          const commentsMatch = text.match(/^(\d+)\s+comments?$/i);
-          if (commentsMatch && comments === 0) {
-            comments = parseInt(commentsMatch[1]);
-            console.log(`✓✓✓ FOUND COMMENTS FROM BUTTON: ${comments} (button text: "${text}")`);
-          }
-
-          // Extract likes/reactions: "27 reactions", "1 reaction", hoặc CHỈ SỐ
-          const likesPatterns = [
-            /^(\d+)\s+reactions?$/i,
-            /^(\d+)$/,  // Chỉ có số (đôi khi Facebook chỉ show số)
-          ];
-
-          for (const pattern of likesPatterns) {
-            const likesMatch = text.match(pattern);
-            if (likesMatch && likes === 0) {
-              const num = parseInt(likesMatch[1]);
-              // Chỉ accept số hợp lý (1-99999), không phải số lớn lạ
-              if (num > 0 && num < 100000) {
-                likes = num;
-                console.log(`✓✓✓ FOUND LIKES FROM BUTTON: ${likes} (button text: "${text}")`);
-                break;
-              }
+          // Extract comments: "384 comments", "1 comment", "384 bình luận"
+          const commentsMatch = text.match(/^(\d+)\s+(?:comments?|bình\s*luận)$/i);
+          if (commentsMatch) {
+            const num = parseInt(commentsMatch[1]);
+            allCommentButtons.push(text);
+            if (comments === 0) {
+              comments = num; // Lấy FIRST (không phải MAX)
             }
           }
-        });
 
+          // Extract likes/reactions: "27 reactions", "1 reaction"
+          const likesMatch = text.match(/^(\d+)\s+reactions?$/i);
+          if (likesMatch && likes === 0) {
+            const num = parseInt(likesMatch[1]);
+            if (num > 0 && num < 100000) {
+              likes = num;
+            }
+          }
+
+          // Dừng khi đã tìm được cả 2
+          if (comments > 0 && likes > 0) break;
+        }
+
+        console.log(`[STATS] ALL comment buttons found: ${JSON.stringify(allCommentButtons)} → first=${comments}`);
+        if (comments > 0) {
+          console.log(`✓✓✓ COMMENTS FROM BUTTONS (FIRST): ${comments}`);
+        }
+        if (likes > 0) {
+          console.log(`✓✓✓ LIKES FROM BUTTONS: ${likes}`);
+        }
         return { likes, comments };
       });
 
@@ -1116,20 +1172,18 @@ export class FacebookCrawlerService {
       this.logger.debug('Bắt đầu load tất cả comments...');
 
       // BƯỚC 1: Mở comments section nếu nó đang đóng
+      // Tìm trong toàn trang (trang post riêng lẻ nên an toàn)
       const openedComments = await page.evaluate(() => {
-        const allButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"]'));
-
-        for (const button of allButtons) {
-          const text = (button.textContent || '').toLowerCase().trim();
-
-          // Tìm button dạng "384 comments" để mở comments section
-          if (text.match(/^\d+\s+comments?$/i)) {
+        const allDocButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"]'));
+        for (const button of allDocButtons) {
+          const text = (button.textContent || '').trim();
+          if (text.match(/^\d+\s+(?:comments?|bình\s*luận)$/i)) {
             (button as HTMLElement).click();
             console.log(`✓ Opened comments section: "${text}"`);
             return true;
           }
         }
-
+        console.log(`⚠️ No comments button found in document`);
         return false;
       });
 
@@ -1138,88 +1192,127 @@ export class FacebookCrawlerService {
         await this.delay(2000); // Đợi comments section load
       }
 
-      // BƯỚC 2: Load tất cả comments bằng cách click "View previous comments"
+      // BƯỚC 2: Load tất cả comments bằng cách click "View previous/more comments" + "View X replies"
+      // Strategy: Click buttons → nếu không tìm thấy, scroll qua page để trigger lazy loading → retry
       let clickCount = 0;
-      const maxClicks = 100; // Giới hạn tối đa 100 lần click để tránh infinite loop
+      let scrollRetries = 0;
+      const maxClicks = 100;
+      const maxScrollRetries = 3; // Scroll tối đa 3 lần để trigger lazy loading
+      // Track button texts đã click → mỗi text chỉ click 1 lần (tránh infinite loop)
+      const clickedTextsSet: string[] = [];
+
+      const findAndClickButton = async (): Promise<{ found: boolean; text: string; available: string[] }> => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return await (page.evaluate as any)((alreadyClicked: string[]) => {
+          const allButtons = Array.from(document.querySelectorAll('[role="button"]'));
+          const availableTexts: string[] = [];
+
+          const priorityButtons: HTMLElement[] = [];
+          const replyButtons: HTMLElement[] = [];
+
+          for (const button of allButtons) {
+            const text = (button.textContent || '').toLowerCase().trim();
+
+            // Thu thập button text để debug
+            if (text && (text.includes('comment') || text.includes('bình luận') || text.includes('repl') ||
+                         text.includes('view') || text.includes('xem') || text.includes('more') ||
+                         text.includes('previous') || text.includes('trước') || text.includes('phản hồi'))) {
+              availableTexts.push(text.substring(0, 100));
+            }
+
+            // Pattern "load more/previous comments" → ưu tiên cao nhất
+            const isMoreComments = (
+              (text.includes('previous') || text.includes('trước')) &&
+              (text.includes('comment') || text.includes('bình luận'))
+            ) || (
+              (text.includes('view') || text.includes('see') || text.includes('xem')) &&
+              (text.includes('more comment') || text.includes('thêm bình luận'))
+            );
+
+            if (isMoreComments) {
+              priorityButtons.push(button as HTMLElement);
+              continue;
+            }
+
+            // Pattern reply buttons → ưu tiên thấp hơn
+            const isReply = (
+              (text.includes('view') || text.includes('see') || text.includes('xem')) &&
+              (text.includes('repl') || text.includes('phản hồi'))
+            ) || text.match(/·\s*\d+\s+(?:repl(?:y|ies)|phản\s*hồi)$/i) !== null
+              || text.match(/^see\s+\d+\s+more(?:\s+\w+)?$/i) !== null  // "see 2 more" / "see 2 more replies"
+              || text.match(/^\d+\s+(?:previous|more)\s+repl/i) !== null; // "3 previous replies"
+
+            if (isReply) {
+              replyButtons.push(button as HTMLElement);
+            }
+          }
+
+          const buttonsToTry = [...priorityButtons, ...replyButtons];
+
+          for (const button of buttonsToTry) {
+            const text = (button.textContent || '').toLowerCase().trim().substring(0, 80);
+            if (alreadyClicked.includes(text)) continue; // Skip đã click rồi
+            (button as HTMLElement).click();
+            console.log(`✓ Clicked: "${text}"`);
+            return { found: true, text, available: availableTexts };
+          }
+
+          return { found: false, text: '', available: availableTexts };
+        }, clickedTextsSet);
+      };
+
+      const scrollThroughPage = async () => {
+        // Scroll từ trên xuống dưới để trigger lazy loading của reply buttons
+        const pageHeight = await page.evaluate(() => document.body.scrollHeight);
+        const step = 600;
+        for (let y = 0; y <= pageHeight + step; y += step) {
+          await page.evaluate((scrollY: number) => window.scrollTo(0, scrollY), y);
+          await this.delay(200);
+        }
+        await this.delay(2000); // Đợi lazy-loaded content xuất hiện
+        await page.evaluate(() => window.scrollTo(0, 0)); // Scroll về đầu
+        await this.delay(300);
+      };
 
       try {
         while (clickCount < maxClicks) {
-          // Tìm và click nút "View more comments" trong page context
-          const { foundButton, buttonTexts, clickedText } = await page.evaluate(() => {
-            // Tìm tất cả buttons
-            const allButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"]'));
-            const buttonTexts: string[] = [];
+          // Scroll lên đầu trước (để thấy "Xem trước đó" buttons nếu có)
+          await page.evaluate(() => { window.scrollTo(0, 0); });
+          await this.delay(300);
 
-            for (const button of allButtons) {
-              const text = (button.textContent || '').toLowerCase().trim();
+          const result = await findAndClickButton();
 
-              // Lưu tất cả button text để debug (chỉ lưu các button có chứa từ liên quan)
-              if (text && (text.includes('comment') || text.includes('bình luận') || text.includes('repl') ||
-                           text.includes('view') || text.includes('xem') || text.includes('more') ||
-                           text.includes('previous') || text.includes('trước'))) {
-                buttonTexts.push(text.substring(0, 100));
-              }
-
-              // Pattern 1: Button có "view"/"see" + "comment/replies"
-              if ((text.includes('view') || text.includes('see') || text.includes('xem')) &&
-                  (text.includes('comment') || text.includes('bình luận') || text.includes('repl'))) {
-                // Click button
-                (button as HTMLElement).click();
-                console.log(`✓ Clicked (pattern 1): "${text.substring(0, 80)}"`);
-                return { foundButton: true, buttonTexts, clickedText: text };
-              }
-
-              // Pattern 2: Button có "more"/"previous" + "comment/replies"
-              if ((text.includes('more') || text.includes('previous') || text.includes('trước')) &&
-                  (text.includes('comment') || text.includes('bình luận') || text.includes('repl'))) {
-                (button as HTMLElement).click();
-                console.log(`✓ Clicked (pattern 2): "${text.substring(0, 80)}"`);
-                return { foundButton: true, buttonTexts, clickedText: text };
-              }
-
-              // Pattern 3: Button kết thúc bằng "X reply" hoặc "X replies"
-              // Ví dụ: "hoàng quốc replied  · 2 replies", "gia phúc replied  · 1 reply"
-              if (text.match(/·\s*\d+\s+repl(y|ies)$/i)) {
-                (button as HTMLElement).click();
-                console.log(`✓ Clicked (pattern 3): "${text.substring(0, 80)}"`);
-                return { foundButton: true, buttonTexts, clickedText: text };
-              }
-            }
-
-            return { foundButton: false, buttonTexts, clickedText: '' };
-          });
-
-          // Debug: In ra các button text tìm được
-          if (!foundButton && clickCount === 0 && buttonTexts.length > 0) {
-            this.logger.debug(`DEBUG: Found ${buttonTexts.length} related buttons: ${JSON.stringify(buttonTexts.slice(0, 10))}`);
-          }
-
-          if (foundButton) {
+          if (result.found) {
+            scrollRetries = 0; // Reset retry count khi tìm được button
             clickCount++;
-            this.logger.debug(`✓ Clicked lần ${clickCount}: "${clickedText}"`);
-            await this.delay(2000); // Đợi comments load
+            clickedTextsSet.push(result.text);
+            this.logger.debug(`✓ Clicked lần ${clickCount}: "${result.text}"`);
+            await this.delay(2500); // Đợi comments load
           } else {
-            // Không tìm thấy button nào, tức là đã load hết
-            this.logger.debug(`Đã load hết comments sau ${clickCount} lần click`);
-            break;
+            // Không tìm thấy button → scroll qua page để trigger lazy loading
+            if (scrollRetries < maxScrollRetries) {
+              scrollRetries++;
+              this.logger.debug(`Không tìm thấy button (scroll retry ${scrollRetries}/${maxScrollRetries}). Available: ${JSON.stringify(result.available.slice(0, 10))}`);
+              await scrollThroughPage();
+              // Thử lại sau khi scroll
+            } else {
+              // Đã scroll đủ lần và vẫn không có button mới → done
+              this.logger.debug(`Đã load hết comments sau ${clickCount} clicks, ${scrollRetries} scroll retries`);
+              break;
+            }
           }
-
-          // Scroll xuống một chút để trigger lazy loading
-          await page.evaluate(() => {
-            window.scrollBy(0, 300);
-          });
-          await this.delay(500);
         }
 
         if (clickCount >= maxClicks) {
-          this.logger.warn(`Đạt giới hạn ${maxClicks} lần click, dừng load comments`);
+          this.logger.warn(`Đạt giới hạn ${maxClicks} lần click`);
         }
       } catch (error) {
         this.logger.warn(`Lỗi khi load comments: ${error.message}`);
       }
 
-      // Đợi một chút sau khi load xong
-      await this.delay(2000);
+      // Scroll về đầu trang để OCR và extract chính xác
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await this.delay(1000);
 
       // ============================================
       // === SCREENSHOT + OCR APPROACH - CHÍNH XÁC 100% ===
@@ -1782,52 +1875,73 @@ export class FacebookCrawlerService {
         // === EXTRACT TẤT CẢ COMMENTS ===
         const comments: Array<{ author: string; content: string; timestamp: string }> = [];
 
-        // Tìm comment elements CHỈ trong phạm vi của post này
-        // Facebook render thêm các post khác bên dưới trang → phải giới hạn phạm vi tìm kiếm
+        // Tìm tất cả "Comment by" trong document, chỉ lấy những element NẰM SAU mainPost
+        // (tránh lấy comments từ các post khác được hiển thị phía trên)
         let commentElements: Element[] = [];
 
-        // Xác định vùng comments của post: là anh em (sibling) hoặc con của statsContainer
-        // Comment section nằm SAU mainPost trong DOM, bên trong statsContainer hoặc parent của nó
-        const postContainer = statsContainer.parentElement || statsContainer;
-
-        // Strategy 1: Tìm trong postContainer (bao gồm main post + comments section ngay bên dưới)
-        const byAriaLabel = Array.from(postContainer.querySelectorAll('[aria-label*="Comment by"], [aria-label*="Bình luận của"]'));
-        if (byAriaLabel.length > 0) {
-          commentElements = byAriaLabel;
-          console.log(`Found ${commentElements.length} comments by aria-label in POST CONTAINER`);
-        }
-
-        // Strategy 2: Nếu không tìm được trong postContainer, tìm toàn document nhưng giới hạn theo vị trí DOM
-        // Chỉ lấy elements xuất hiện SAU mainPost (comments section)
-        if (commentElements.length === 0) {
-          const allByAriaLabel = Array.from(document.querySelectorAll('[aria-label*="Comment by"], [aria-label*="Bình luận của"]'));
-          // Lọc: chỉ giữ elements nằm SAU mainPost trong DOM (not contained within mainPost itself)
-          commentElements = allByAriaLabel.filter(elem => {
-            const position = mainPost.compareDocumentPosition(elem);
-            // Node.DOCUMENT_POSITION_FOLLOWING = 4 → elem nằm sau mainPost
-            return (position & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+        // === DEBUG: Xem TẤT CẢ aria-label liên quan đến comment để tìm pattern đúng ===
+        const allAriaElems = Array.from(document.querySelectorAll('[aria-label]'));
+        const commentRelatedLabels = allAriaElems
+          .map(el => el.getAttribute('aria-label') || '')
+          .filter(l => {
+            const lc = l.toLowerCase();
+            return lc.includes('comment') || lc.includes('bình luận') || lc.includes('reply') || lc.includes('phản hồi') || lc.includes('bởi') || lc.includes(' by ');
           });
-          console.log(`Found ${commentElements.length} comments AFTER main post in document`);
-        }
+        console.log(`=== ALL comment-related aria-labels (${commentRelatedLabels.length}): ${JSON.stringify(commentRelatedLabels.slice(0, 30))}`);
+
+        // === TÌM COMMENTS của MAIN POST ===
+        // Strategy: Lấy TẤT CẢ comment elements SAU mainPost VÀ KHÔNG nằm trong article nào khác
+        // Logic:
+        // - Main post comments: nằm SAU mainPost, KHÔNG nằm trong bất kỳ [role="article"] nào
+        //   (comments section là SIBLING của main post article, không phải con)
+        // - Related post comments: nằm SAU mainPost, nhưng nằm TRONG article của related post đó
+        //   → loại trừ bằng cách check ancestor
+        const allCommentElems = Array.from(document.querySelectorAll(
+          '[aria-label*="Comment by"], [aria-label*="Bình luận của"], [aria-label*="Bình luận bởi"], [aria-label*="Reply by"], [aria-label*="Phản hồi của"], [aria-label*="Phản hồi bởi"]'
+        ));
+
+        commentElements = allCommentElems.filter(elem => {
+          // Phải nằm SAU mainPost trong DOM
+          if (!(mainPost.compareDocumentPosition(elem) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+
+          // KHÔNG được nằm trong bất kỳ [role="article"] nào (kể cả mainPost hay related posts)
+          // Vì comments section của main post là SIBLING, không phải CON của article
+          let ancestor: Element | null = elem.parentElement;
+          while (ancestor && ancestor !== document.body) {
+            if (ancestor.getAttribute('role') === 'article') return false; // Nằm trong article → related post
+            ancestor = ancestor.parentElement;
+          }
+          return true;
+        });
+
+        console.log(`Found ${commentElements.length} comment elements (after mainPost, not inside any article)`);
 
         // === ĐẾM UNIQUE COMMENTERS trực tiếp từ aria-label ===
         // Set tự xử lý trùng lặp: 1 người comment 3 lần vẫn chỉ đếm là 1
         const uniqueAuthors = new Set<string>();
-        const authorRegex = /(?:Comment by|Bình luận của)\s+(.+?)(?:\s*[·•]\s*|\s+\d+\s+(?:minute|hour|day|second|week|month|year|giờ|phút|giây|ngày|tuần|tháng|năm)|$)/i;
-
+        // Patterns:
+        // "Comment by NAME 4 minutes ago"
+        // "Comment by NAME about an hour ago"   ← tricky: "about an hour" không có số
+        // "Reply by NAME to OTHER's comment 2 seconds ago" → chỉ lấy NAME, dừng tại " to "
+        // "Bình luận của TÊN · 5 phút"
         for (const elem of commentElements) {
           const ariaLabel = elem.getAttribute('aria-label') || '';
-          const authorMatch = ariaLabel.match(authorRegex);
-          if (authorMatch) {
-            const name = authorMatch[1].trim();
-            if (name) uniqueAuthors.add(name);
+          // Bước 1: Lấy phần sau "Comment by" đến " to " hoặc " · " hoặc hết
+          const rawMatch = ariaLabel.match(
+            /(?:Comment by|Reply by|Bình luận của|Bình luận bởi|Phản hồi của|Phản hồi bởi)\s+(.+?)(?:\s+to\s+\S|\s*[·•]\s*|$)/i
+          );
+          if (rawMatch) {
+            let name = rawMatch[1].trim();
+            // Bước 2: Xóa phần thời gian ở cuối (e.g. "4 minutes ago", "about an hour ago", "just now")
+            name = name.replace(/\s+(?:(?:about|just|around|khoảng)\s+)?(?:an?\s+|\d+\s+)?(?:minute|hour|day|second|week|month|year|giờ|phút|giây|ngày|tuần|tháng|năm)s?\s*(?:ago)?$/i, '').trim();
+            name = name.replace(/\s+(?:just now|vừa xong|vừa rồi|now)$/i, '').trim();
+            if (name && name.length > 1) uniqueAuthors.add(name);
           }
         }
 
-        const uniqueCommentersCount = uniqueAuthors.size;
-        console.log(`Unique commenters: ${uniqueCommentersCount} (${[...uniqueAuthors].slice(0, 10).join(', ')})`);
-
-        console.log(`Extracted from post page: content.length=${content.length}, images=${imageUrls.length}, likes=${likesCount}, comments=${commentsCount}, uniqueCommenters=${uniqueCommentersCount}, shares=${sharesCount}`);
+        const uniqueAuthorNames = Array.from(uniqueAuthors);
+        console.log(`DOM unique authors (${uniqueAuthorNames.length}): ${JSON.stringify(uniqueAuthorNames.slice(0, 20))}`);
+        console.log(`Extracted from post page: content.length=${content.length}, images=${imageUrls.length}, likes=${likesCount}, comments=${commentsCount}, uniqueCommenters(DOM)=${uniqueAuthorNames.length}, shares=${sharesCount}`);
 
         return {
           content: content || '[No content]',
@@ -1836,7 +1950,7 @@ export class FacebookCrawlerService {
           commentsCount,
           comments,
           sharesCount,
-          uniqueCommentersCount,
+          uniqueAuthorNames,
         };
       });
 
@@ -1873,10 +1987,35 @@ export class FacebookCrawlerService {
         this.logger.warn(`⚠️ Fallback HTML parsing comments: ${finalCommentsCount}`);
       }
 
+      // Kết hợp Network + DOM để có danh sách unique commenters chính xác nhất
+      // Network: capture tên từ GraphQL responses khi load thêm comments
+      // DOM: capture tên từ aria-label của comments đã render sẵn trong HTML
+      const networkNames = Array.from(commentersFromNetwork);
+      const domNames: string[] = (data as any).uniqueAuthorNames || [];
+      const combinedAuthors = new Set([...domNames, ...networkNames]);
+      const combinedUniqueCount = combinedAuthors.size;
+
+      this.logger.log(`🌐 Network: ${networkNames.length} names | DOM: ${domNames.length} names | Combined: ${combinedUniqueCount} unique`);
+      if (networkNames.length > 0) {
+        this.logger.debug(`🌐 Network names: ${JSON.stringify(networkNames.slice(0, 20))}`);
+      }
+
+      // KHÔNG cap unique bởi commentsCount vì:
+      // - commentsCount có thể chỉ đếm top-level comments (không tính replies)
+      // - Nhưng uniqueCommenters đếm cả người reply → có thể > commentsCount một cách hợp lệ
+      const finalUniqueCommentersCount = combinedUniqueCount;
+      this.logger.log(`✅ Final unique commenters: ${finalUniqueCommentersCount} (DOM=${domNames.length}, network=${networkNames.length})`);
+
+      // Đảm bảo tính nhất quán: commentsCount >= uniqueCommentersCount
+      const consistentCommentsCount = Math.max(finalCommentsCount, finalUniqueCommentersCount);
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { uniqueAuthorNames: _removed, ...dataWithoutNames } = data as any;
       return {
-        ...data,
+        ...dataWithoutNames,
         likesCount: finalLikesCount,
-        commentsCount: finalCommentsCount,
+        commentsCount: consistentCommentsCount,
+        uniqueCommentersCount: finalUniqueCommentersCount,
       };
     } catch (error) {
       this.logger.error(`Error extracting post data: ${error.message}`);
@@ -1889,6 +2028,10 @@ export class FacebookCrawlerService {
         comments: [],
         sharesCount: 0,
       };
+    } finally {
+      try {
+        page.off('response', responseHandler);
+      } catch (_) {}
     }
   }
 

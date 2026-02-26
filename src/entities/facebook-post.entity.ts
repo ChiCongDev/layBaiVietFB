@@ -23,13 +23,13 @@ export class FacebookPost {
   @Column({ name: 'author_name', nullable: true })
   authorName: string;
 
-  @Column({ name: 'author_profile_url', nullable: true })
+  @Column({ name: 'author_profile_url', type: 'text', nullable: true })
   authorProfileUrl: string;
 
   @Column({ type: 'text', nullable: true })
   content: string;
 
-  @Column({ name: 'post_url', nullable: true })
+  @Column({ name: 'post_url', type: 'text', nullable: true })
   postUrl: string;
 
   @Column({ name: 'image_urls', type: 'json', nullable: true })
